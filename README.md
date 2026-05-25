@@ -66,8 +66,8 @@ For each specimen, the tool writes visual explainability artifacts such as:
 ```
 
 ## Links
-* Source code: [https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer](https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer)
-* Archived version: [https://doi.org/10.5281/zenodo.20258408](https://doi.org/10.5281/zenodo.20258408)
+* Source code: [https://github.com/TowaUeya/Morphological-Embedding-Explainability](https://github.com/TowaUeya/Morphological-Embedding-Explainability)
+* Archived version: [https://doi.org/10.5281/zenodo.20258440](https://doi.org/10.5281/zenodo.20258440)
 
 ## Related Repositories
 
@@ -77,6 +77,6 @@ This repository provides the embedding-generation pipeline. Downstream analyses 
   [https://github.com/TowaUeya/MultiView3D-DINOv2](https://github.com/TowaUeya/MultiView3D-DINOv2)  
   Software pipeline for rendering multi-view images from 3D specimens and extracting frozen DINOv2 embeddings.
 
-- **Repository-Name-2**  
-  https://github.com/TowaUeya/Repository-Name-2  
-  Briefly describe what this repository is used for and how it relates to MultiView3D-DINO
+- **Morphological-Embedding-Space-Analyzer**  
+  [https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer](https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer)  
+  Analysis toolkit for evaluating nearest-neighbor retrieval, HDBSCAN-based auxiliary structure, leaf-core regions, residual samples, and publication figures.
