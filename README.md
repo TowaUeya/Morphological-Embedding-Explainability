@@ -64,3 +64,19 @@ For each specimen, the tool writes visual explainability artifacts such as:
   note = {Attention rollout visualization toolkit for multi-view DINOv2 representations}
 }
 ```
+
+## Links
+* Source code: [https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer](https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer)
+* Archived version: [https://doi.org/10.5281/zenodo.20258408](https://doi.org/10.5281/zenodo.20258408)
+
+## Related Repositories
+
+This repository provides the embedding-generation pipeline. Downstream analyses and related tools are maintained in the following repositories:
+
+- **MultiView3D-DINOv2**  
+  [https://github.com/TowaUeya/MultiView3D-DINOv2](https://github.com/TowaUeya/MultiView3D-DINOv2)  
+  Software pipeline for rendering multi-view images from 3D specimens and extracting frozen DINOv2 embeddings.
+
+- **Repository-Name-2**  
+  https://github.com/TowaUeya/Repository-Name-2  
+  Briefly describe what this repository is used for and how it relates to MultiView3D-DINO
