@@ -1,5 +1,5 @@
 # Morphological Embedding Explainability: Attention rollout visualization for multi-view DINOv2 representations
-Explainability toolkit for visualizing attention rollout, gradient-weighted attention rollout, and visual evidence associated with ViT-based embedding formation.
+Explainability toolkit for visualizing attention rollout, gradient-weighted attention rollout, and image-level cues associated with ViT-based embedding formation.
 
 ## Requirements
 - Python 3.10+
@@ -60,7 +60,10 @@ For each specimen, the tool writes visual explainability artifacts such as:
 ```bibtex
 @software{morphological_embedding_explainability,
   title = {Morphological Embedding Explainability},
-  year = {2026},
+  author = {Ueya, Towa and Iba, Yasuhiro},
+  year   = {2026},
+  url    = {https://github.com/TowaUeya/Morphological-Embedding-Explainability},
+  doi    = {10.5281/zenodo.20258440},
   note = {Attention rollout visualization toolkit for multi-view DINOv2 representations}
 }
 ```
