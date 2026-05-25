@@ -71,12 +71,12 @@ For each specimen, the tool writes visual explainability artifacts such as:
 
 ## Related Repositories
 
-Morphological-Embedding-Space-Analyzer is the embedding-space analysis component of a small research software ecosystem for morphology-based analysis of 3D specimen models. It assumes that specimen-level embeddings have already been generated, and connects those embeddings to retrieval, clustering, visualization, and evaluation workflows.
+Morphological-Embedding-Explainability is the interpretability component of a small research software ecosystem for morphology-based analysis of 3D specimen models. It complements the embedding-generation and embedding-space analysis repositories by visualizing image-level evidence associated with ViT-based embedding formation.
 
 - **Embedding generation**  
   **MultiView3D-DINOv2**  
   [https://github.com/TowaUeya/MultiView3D-DINOv2](https://github.com/TowaUeya/MultiView3D-DINOv2)  
-  Renders multi-view images from 3D specimen models and extracts frozen DINOv2 features, producing the specimen-level embeddings used as input for this repository.
+  Renders multi-view images from 3D specimen models and extracts frozen DINOv2 features, producing specimen-level embeddings and rendered views that can be used for explainability visualization.
 
 - **Embedding-space analysis**  
   **Morphological-Embedding-Space-Analyzer**  
@@ -86,4 +86,4 @@ Morphological-Embedding-Space-Analyzer is the embedding-space analysis component
 - **Embedding explainability**  
   **Morphological-Embedding-Explainability**  
   [https://github.com/TowaUeya/Morphological-Embedding-Explainability](https://github.com/TowaUeya/Morphological-Embedding-Explainability)  
-  Complements embedding-space analysis by visualizing attention rollout and related image-level evidence, helping interpret which rendered views and visual cues contribute to ViT-based embedding formation.
+  Uses rendered multi-view images, embeddings, specimen IDs, and optional cluster information to visualize attention rollout and related evidence, helping interpret which image-level cues contribute to ViT-based embedding formation.
