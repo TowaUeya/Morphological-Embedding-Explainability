@@ -40,10 +40,10 @@ python -m src.explain_vit_attention \
   --out results/explain \
   --model dinov2_vits14 \
   --device auto \
-  --image-size 224 \
-  --crop-size 224 \
+  --image-size 518 \
+  --crop-size 518 \
   --layers all \
-  --num-show 6
+  --num-show 12
 ```
 
 ## Outputs
