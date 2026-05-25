@@ -1,6 +1,8 @@
 # Morphological Embedding Explainability: Attention rollout visualization for multi-view DINOv2 representations
 Explainability toolkit for visualizing attention rollout, gradient-weighted attention rollout, and image-level cues associated with ViT-based embedding formation.
 
+This repository does not compute embeddings or perform clustering. It visualizes attention-based cues using rendered views and precomputed embeddings.
+
 ## Requirements
 - Python 3.10+
 - PyTorch-compatible environment (CPU or CUDA)
@@ -74,19 +76,21 @@ For each specimen, the tool writes visual explainability artifacts such as:
 
 ## Related Repositories
 
-Morphological-Embedding-Explainability is the interpretability component of a small research software ecosystem for morphology-based analysis of 3D specimen models. It complements the embedding-generation and embedding-space analysis repositories by visualizing image-level evidence associated with ViT-based embedding formation.
+Morphological-Embedding-Explainability is the interpretability component of this ecosystem. It uses rendered views and precomputed embeddings to visualize attention-based image-level cues associated with ViT-based embedding formation.
+
+This repository is part of a small research software ecosystem for morphology-based analysis of 3D specimen models.
 
 - **Embedding generation**  
   **MultiView3D-DINOv2**  
   [https://github.com/TowaUeya/MultiView3D-DINOv2](https://github.com/TowaUeya/MultiView3D-DINOv2)  
-  Renders multi-view images from 3D specimen models and extracts frozen DINOv2 features, producing specimen-level embeddings and rendered views that can be used for explainability visualization.
+  Renders multi-view images from 3D specimen models and extracts frozen DINOv2 features, producing specimen-level embeddings and rendered views for downstream analysis and visualization.
 
 - **Embedding-space analysis**  
   **Morphological-Embedding-Space-Analyzer**  
   [https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer](https://github.com/TowaUeya/Morphological-Embedding-Space-Analyzer)  
-  Performs downstream analysis of specimen-level embeddings, including nearest-neighbor retrieval, HDBSCAN-based auxiliary structure extraction, leaf-core and residual analysis, visualization, and publication-oriented figure generation.
+  Performs downstream analysis of specimen-level embeddings, including retrieval evaluation, HDBSCAN-based clustering, leaf-core and residual sample extraction, embedding-space visualization, and publication-oriented figure generation.
 
 - **Embedding explainability**  
   **Morphological-Embedding-Explainability**  
   [https://github.com/TowaUeya/Morphological-Embedding-Explainability](https://github.com/TowaUeya/Morphological-Embedding-Explainability)  
-  Uses rendered multi-view images, embeddings, specimen IDs, and optional cluster information to visualize attention rollout and related evidence, helping interpret which image-level cues contribute to ViT-based embedding formation.
+  Uses rendered multi-view images, embeddings, specimen IDs, and optional cluster information to visualize attention rollout and image-level visual cues associated with ViT-based embedding formation.
