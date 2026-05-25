@@ -49,24 +49,24 @@ python -m src.explain_vit_attention \
 ```
 
 ## Outputs
-For each specimen, the tool writes visual explainability artifacts such as:
+For each specimen, the tool writes attention-visualization artifacts such as:
 - `attention_rollout.png`
 - `grad_rollout_similarity_to_specimen.png`
 - Per-view overlays and summary plots
 
 ## Interpretation Notes
 - Attention maps are **not** direct identification of taxonomic or morphological traits.
-- These outputs are auxiliary visual evidence of cues contributing to ViT-based embedding formation.
+- These outputs are auxiliary visualizations of image-level cues associated with ViT-based embedding formation.
 
 ## Citation
 ```bibtex
 @software{morphological_embedding_explainability,
-  title = {Morphological Embedding Explainability},
+  title  = {Morphological Embedding Explainability},
   author = {Ueya, Towa and Iba, Yasuhiro},
   year   = {2026},
   url    = {https://github.com/TowaUeya/Morphological-Embedding-Explainability},
   doi    = {10.5281/zenodo.20258440},
-  note = {Attention rollout visualization toolkit for multi-view DINOv2 representations}
+  note   = {Attention rollout visualization toolkit for multi-view DINOv2 representations}
 }
 ```
 
