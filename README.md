@@ -38,13 +38,9 @@ python -m src.explain_vit_attention \
   --renders data/renders \
   --emb data/embeddings/embeddings.npy \
   --ids data/embeddings/ids.txt \
-  --clusters data/embeddings/clusters.csv \
   --out results/explain \
-  --model dinov2_vits14 \
-  --device auto \
-  --image-size 518 \
-  --crop-size 518 \
-  --layers all \
+  --image-size 768 \
+  --crop-size 768 \
   --num-show 12
 ```
 

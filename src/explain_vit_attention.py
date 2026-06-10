@@ -11,22 +11,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from timm.layers import apply_rot_embed_cat
 from tqdm.auto import tqdm
 
 from src.utils.explain import attention_rollout, grad_attention_rollout, to_patch_heatmap
 from src.utils.io import ensure_dir, group_renders_by_specimen, list_image_files, load_ids
-from src.utils.vision import build_transform, forward_embedding, load_dinov2_model, load_image_tensor, resolve_device
+from src.utils.vision import build_transform, forward_embedding, load_dinov3_model, load_image_tensor, resolve_device
 
 LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Explain DINOv2 attention for embedding formation")
+    p = argparse.ArgumentParser(description="Explain DINOv3 attention for embedding formation")
     p.add_argument("--renders", type=Path, required=True)
-    p.add_argument("--features", type=Path, required=False, default=None)
     p.add_argument("--emb", type=Path, required=True)
     p.add_argument("--ids", type=Path, required=True)
-    p.add_argument("--clusters", type=Path, required=False, default=None)
     p.add_argument(
         "--specimen_id",
         type=str,
@@ -35,7 +34,7 @@ def parse_args() -> argparse.Namespace:
         help="Target specimen ID. If omitted, all specimen IDs found in both renders and --ids are processed.",
     )
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--model", type=str, default="dinov2_vits14")
+    p.add_argument("--model", type=str, default="dinov3_vitb16")
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--crop-size", type=int, default=224)
@@ -78,15 +77,44 @@ def _reset_block_attn_cache(blocks: list[torch.nn.Module]) -> None:
         blk.attn._last_attn_grad = None
 
 
-def _unwrap_qkv(qkv: torch.Tensor, x: torch.Tensor, num_heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    bsz, n_tokens, dim = x.shape
-    head_dim = dim // num_heads
-    qkv = qkv.reshape(bsz, n_tokens, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
-    q, k, v = qkv.unbind(0)
+def _eva_qkv(attn_obj: torch.nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """EvaAttentionと同じ手順で q, k, v を [B, heads, N, head_dim] で取り出す。
+
+    DINOv3(EVA系)はfused qkv(bias無し)＋別個のq/k/v bufferを使う構成と、
+    分離したq_proj/k_proj/v_projを使う構成の両方があり得るため両対応する。
+    """
+    bsz, n_tokens, _ = x.shape
+    num_heads = int(getattr(attn_obj, "num_heads", 1))
+
+    qkv_layer = getattr(attn_obj, "qkv", None)
+    if qkv_layer is not None:
+        q_bias = getattr(attn_obj, "q_bias", None)
+        if q_bias is None:
+            qkv = qkv_layer(x)
+        else:
+            # base版はbias無しだが、_qkvb版は q_bias/k_bias/v_bias を結合して適用する
+            qkv_bias = torch.cat((attn_obj.q_bias, attn_obj.k_bias, attn_obj.v_bias))
+            if getattr(attn_obj, "qkv_bias_separate", False):
+                qkv = qkv_layer(x)
+                qkv = qkv + qkv_bias
+            else:
+                qkv = F.linear(x, weight=qkv_layer.weight, bias=qkv_bias)
+        qkv = qkv.reshape(bsz, n_tokens, 3, num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+    else:
+        q = attn_obj.q_proj(x).reshape(bsz, n_tokens, num_heads, -1).transpose(1, 2)
+        k = attn_obj.k_proj(x).reshape(bsz, n_tokens, num_heads, -1).transpose(1, 2)
+        v = attn_obj.v_proj(x).reshape(bsz, n_tokens, num_heads, -1).transpose(1, 2)
     return q, k, v
 
 
 def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward: Any):
+    """EvaAttention.forward を忠実に再現しつつ、softmax後のattention重みを捕捉する。
+
+    DINOv3はRoPE(回転位置埋め込み)を使うため、qkvを手動再計算する際にRoPEを
+    適用しないとattentionマップが実際のモデルと一致しない。blockから渡される
+    ``rope`` テンソルを受け取り、prefixトークン(CLS+register)以外に適用する。
+    """
     del original_forward
 
     def wrapped_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
@@ -97,6 +125,11 @@ def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward:
         if x is None:
             raise ValueError("Attention wrapper received no input tensor.")
 
+        # blockは self.attn(x, rope=rope, attn_mask=attn_mask) で呼ぶ
+        rope = kwargs.get("rope", None)
+        if rope is None and len(args) > 1:
+            rope = args[1]
+
         attn_mask = kwargs.get("attn_mask", None)
         if attn_mask is not None and not getattr(attn_obj, "_warned_attn_mask_ignored", False):
             LOGGER.warning(
@@ -106,10 +139,8 @@ def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward:
             attn_obj._warned_attn_mask_ignored = True
 
         bsz, n_tokens, dim = x.shape
-        num_heads = int(getattr(attn_obj, "num_heads", 1))
 
-        qkv = attn_obj.qkv(x)
-        q, k, v = _unwrap_qkv(qkv, x, num_heads)
+        q, k, v = _eva_qkv(attn_obj, x)
 
         q_norm = getattr(attn_obj, "q_norm", None)
         if q_norm is not None:
@@ -118,16 +149,25 @@ def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward:
         if k_norm is not None:
             k = k_norm(k)
 
+        # RoPE適用: prefixトークン(CLS+register)には適用せず、patchトークンのみ回転させる
+        if rope is not None:
+            num_prefix = int(getattr(attn_obj, "num_prefix_tokens", 1))
+            half = bool(getattr(attn_obj, "rotate_half", False))
+            q = torch.cat(
+                [q[:, :, :num_prefix, :], apply_rot_embed_cat(q[:, :, num_prefix:, :], rope, half=half)],
+                dim=2,
+            ).type_as(v)
+            k = torch.cat(
+                [k[:, :, :num_prefix, :], apply_rot_embed_cat(k[:, :, num_prefix:, :], rope, half=half)],
+                dim=2,
+            ).type_as(v)
+
         scale = getattr(attn_obj, "scale", None)
         if scale is None:
-            scale = (dim // num_heads) ** -0.5
+            scale = (dim // int(getattr(attn_obj, "num_heads", 1))) ** -0.5
 
-        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = (q * scale) @ k.transpose(-2, -1)
         attn = attn.softmax(dim=-1)
-
-        attn_drop = getattr(attn_obj, "attn_drop", None)
-        if attn_drop is not None:
-            attn = attn_drop(attn)
 
         attn_obj._last_attn_map = attn
         attn_obj._last_attn_grad = None
@@ -139,7 +179,15 @@ def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward:
 
             attn.register_hook(_save_grad)
 
-        x_out = (attn @ v).transpose(1, 2).reshape(bsz, n_tokens, dim)
+        attn_drop = getattr(attn_obj, "attn_drop", None)
+        attn_out = attn_drop(attn) if attn_drop is not None else attn
+
+        x_out = (attn_out @ v).transpose(1, 2).reshape(bsz, n_tokens, -1)
+
+        # EVAのscale_norm(self.norm)。DINOv3 base版ではIdentityなので無影響
+        norm = getattr(attn_obj, "norm", None)
+        if norm is not None:
+            x_out = norm(x_out)
 
         proj = getattr(attn_obj, "proj", None)
         if proj is not None:
@@ -173,16 +221,6 @@ def _restore_attention_wrappers(restore_state: list[tuple[torch.nn.Module, Any, 
         if old_fused is _MISSING:
             continue
         attn.fused_attn = old_fused
-
-
-def _resolve_num_patches(model: torch.nn.Module) -> int | None:
-    patch_embed = getattr(model, "patch_embed", None)
-    if patch_embed is None:
-        return None
-    num_patches = getattr(patch_embed, "num_patches", None)
-    if isinstance(num_patches, int) and num_patches > 0:
-        return num_patches
-    return None
 
 
 def _cls_to_patch_tokens(cls_to_tokens: torch.Tensor, num_patches: int | None, image_path: Path) -> torch.Tensor:
@@ -225,13 +263,16 @@ def main() -> None:
     ensure_dir(args.out)
 
     device = resolve_device(args.device)
-    model = load_dinov2_model(args.model, device)
+    model = load_dinov3_model(args.model, device)
     transform = build_transform(args.image_size, args.crop_size)
 
     blocks = _collect_blocks(model)
     rollout_blocks = _select_blocks_for_rollout(blocks, args.layers)
     restore_state = _install_attention_wrappers(rollout_blocks)
-    num_patches = _resolve_num_patches(model)
+    # DINOv3はCLS+registerトークンを持つ。patch_embed.num_patchesは学習時の
+    # デフォルト解像度に固定された値で実解像度と一致しないため使わず、
+    # 実際のトークン数 T から num_patches = T - num_prefix_tokens を動的に求める。
+    num_prefix_tokens = int(getattr(model, "num_prefix_tokens", 1))
 
     render_files = list_image_files(args.renders)
     grouped = group_renders_by_specimen(render_files, root_dir=args.renders)
@@ -318,6 +359,10 @@ def main() -> None:
 
                 roll = attention_rollout(attn_maps)
                 grad_roll = grad_attention_rollout(attn_maps, attn_grads)
+
+                # attention行列のサイズ T からpatch数を算出（CLS+registerを除外）
+                n_total_tokens = int(attn_maps[0].shape[-1])
+                num_patches = n_total_tokens - num_prefix_tokens
 
                 roll_tokens = _cls_to_patch_tokens(roll[0], num_patches, ip)
                 grad_tokens = _cls_to_patch_tokens(grad_roll[0], num_patches, ip)
