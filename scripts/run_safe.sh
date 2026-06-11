@@ -30,7 +30,18 @@ IMAGE_SIZE="${IMAGE_SIZE:-768}"   # keep 768px
 CROP_SIZE="${CROP_SIZE:-768}"
 NUM_SHOW="${NUM_SHOW:-12}"
 COOLDOWN="${COOLDOWN:-5}"         # cool-down seconds after each specimen (thermal / power relief)
-VRAM_FRACTION="${VRAM_FRACTION:-0.9}"  # cap process VRAM to this fraction; exceeding it raises OOM instead of hanging
+# Rollout source passed to --layers.
+#   all  : capture every block's attention (full multi-layer rollout). Per-view peak ~9.4GB at 768px,
+#          which sits right at the VRAM cliff on an 11GB GPU (e.g. RTX 2080 Ti / Turing).
+#   last : capture only the final block (~2.45GB peak). Guaranteed-fit fallback if `all` keeps OOMing:
+#          run  LAYERS=last bash scripts/run_safe.sh
+LAYERS="${LAYERS:-all}"
+# Cap process VRAM to this fraction of TOTAL memory; exceeding it raises a clean OOM instead of hanging.
+# 0.93 is the practical maximum for an 11GB card: 0.93*11264MiB ~= 10475MiB, still just under the
+# ~10.5GB that the desktop (Xwayland) leaves free, so the process gets the most headroom possible
+# without fighting the display for physical VRAM. Going higher risks a driver-level hang. At 768px with
+# --layers all the per-view peak is right at this edge on Turing; if it still OOMs, use LAYERS=last.
+VRAM_FRACTION="${VRAM_FRACTION:-0.93}"
 COOLDOWN_AFTER_CRASH="${COOLDOWN_AFTER_CRASH:-30}"  # seconds to let the GPU cool down after a crash
 MAX_RETRIES="${MAX_RETRIES:-1000}"
 
@@ -52,6 +63,7 @@ while :; do
     --image-size "${IMAGE_SIZE}" \
     --crop-size "${CROP_SIZE}" \
     --num-show "${NUM_SHOW}" \
+    --layers "${LAYERS}" \
     --resume \
     --cooldown "${COOLDOWN}" \
     --vram-fraction "${VRAM_FRACTION}"
