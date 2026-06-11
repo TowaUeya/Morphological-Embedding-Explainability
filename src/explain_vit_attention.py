@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import sys
+import time
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -45,6 +47,30 @@ def parse_args() -> argparse.Namespace:
         default=6,
         help="Number of views to visualize. If larger than available views, all available views are shown.",
     )
+    # --- Safe-mode options (keep settings such as 768px while preventing/recovering from hangs & crashes) ---
+    p.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip specimens whose outputs already exist and resume midway (enabled by default). Lets a re-run continue from where a crash stopped.",
+    )
+    p.add_argument(
+        "--cooldown",
+        type=float,
+        default=0.0,
+        help="Seconds to wait after each specimen to let the GPU cool down (thermal / power-spike relief; 3-10s recommended if time allows).",
+    )
+    p.add_argument(
+        "--vram-fraction",
+        type=float,
+        default=None,
+        help="Upper bound on process VRAM as a fraction (0-1). When set, exceeding it raises OOM and stops safely instead of hanging. e.g. 0.9",
+    )
+    p.add_argument(
+        "--strict-sync",
+        action="store_true",
+        help="Call torch.cuda.synchronize() after each view to detect CUDA errors early and at their true location (slightly slower, useful for diagnosis).",
+    )
     return p.parse_args()
 
 
@@ -78,10 +104,10 @@ def _reset_block_attn_cache(blocks: list[torch.nn.Module]) -> None:
 
 
 def _eva_qkv(attn_obj: torch.nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """EvaAttentionと同じ手順で q, k, v を [B, heads, N, head_dim] で取り出す。
+    """Extract q, k, v as [B, heads, N, head_dim] following the same procedure as EvaAttention.
 
-    DINOv3(EVA系)はfused qkv(bias無し)＋別個のq/k/v bufferを使う構成と、
-    分離したq_proj/k_proj/v_projを使う構成の両方があり得るため両対応する。
+    DINOv3 (EVA family) may use either a fused qkv (no bias) plus separate q/k/v
+    buffers, or separate q_proj/k_proj/v_proj projections, so both layouts are supported.
     """
     bsz, n_tokens, _ = x.shape
     num_heads = int(getattr(attn_obj, "num_heads", 1))
@@ -92,7 +118,7 @@ def _eva_qkv(attn_obj: torch.nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, 
         if q_bias is None:
             qkv = qkv_layer(x)
         else:
-            # base版はbias無しだが、_qkvb版は q_bias/k_bias/v_bias を結合して適用する
+            # The base variant has no bias; the _qkvb variant concatenates q_bias/k_bias/v_bias and applies them
             qkv_bias = torch.cat((attn_obj.q_bias, attn_obj.k_bias, attn_obj.v_bias))
             if getattr(attn_obj, "qkv_bias_separate", False):
                 qkv = qkv_layer(x)
@@ -109,11 +135,11 @@ def _eva_qkv(attn_obj: torch.nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, 
 
 
 def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward: Any):
-    """EvaAttention.forward を忠実に再現しつつ、softmax後のattention重みを捕捉する。
+    """Faithfully reproduce EvaAttention.forward while capturing the post-softmax attention weights.
 
-    DINOv3はRoPE(回転位置埋め込み)を使うため、qkvを手動再計算する際にRoPEを
-    適用しないとattentionマップが実際のモデルと一致しない。blockから渡される
-    ``rope`` テンソルを受け取り、prefixトークン(CLS+register)以外に適用する。
+    DINOv3 uses RoPE (rotary position embedding), so when recomputing qkv by hand,
+    RoPE must be applied or the attention maps will not match the real model. The
+    ``rope`` tensor passed from the block is applied to all tokens except the prefix (CLS+register).
     """
     del original_forward
 
@@ -125,7 +151,7 @@ def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward:
         if x is None:
             raise ValueError("Attention wrapper received no input tensor.")
 
-        # blockは self.attn(x, rope=rope, attn_mask=attn_mask) で呼ぶ
+        # The block calls self.attn(x, rope=rope, attn_mask=attn_mask)
         rope = kwargs.get("rope", None)
         if rope is None and len(args) > 1:
             rope = args[1]
@@ -149,7 +175,7 @@ def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward:
         if k_norm is not None:
             k = k_norm(k)
 
-        # RoPE適用: prefixトークン(CLS+register)には適用せず、patchトークンのみ回転させる
+        # Apply RoPE: do not apply to prefix tokens (CLS+register); rotate only the patch tokens
         if rope is not None:
             num_prefix = int(getattr(attn_obj, "num_prefix_tokens", 1))
             half = bool(getattr(attn_obj, "rotate_half", False))
@@ -184,7 +210,7 @@ def _make_attention_forward_wrapper(attn_obj: torch.nn.Module, original_forward:
 
         x_out = (attn_out @ v).transpose(1, 2).reshape(bsz, n_tokens, -1)
 
-        # EVAのscale_norm(self.norm)。DINOv3 base版ではIdentityなので無影響
+        # EVA's scale_norm (self.norm). It is Identity in the DINOv3 base variant, so it has no effect
         norm = getattr(attn_obj, "norm", None)
         if norm is not None:
             x_out = norm(x_out)
@@ -266,12 +292,18 @@ def main() -> None:
     model = load_dinov3_model(args.model, device)
     transform = build_transform(args.image_size, args.crop_size)
 
+    # Safe mode: capping VRAM as a fraction makes it stop with OOM instead of hanging when the cap is exceeded
+    if device.type == "cuda" and args.vram_fraction is not None:
+        torch.cuda.set_per_process_memory_fraction(args.vram_fraction, device.index or 0)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     blocks = _collect_blocks(model)
     rollout_blocks = _select_blocks_for_rollout(blocks, args.layers)
     restore_state = _install_attention_wrappers(rollout_blocks)
-    # DINOv3はCLS+registerトークンを持つ。patch_embed.num_patchesは学習時の
-    # デフォルト解像度に固定された値で実解像度と一致しないため使わず、
-    # 実際のトークン数 T から num_patches = T - num_prefix_tokens を動的に求める。
+    # DINOv3 has CLS+register tokens. patch_embed.num_patches is fixed to the
+    # training-time default resolution and does not match the actual resolution,
+    # so instead derive num_patches = T - num_prefix_tokens dynamically from the actual token count T.
     num_prefix_tokens = int(getattr(model, "num_prefix_tokens", 1))
 
     render_files = list_image_files(args.renders)
@@ -304,6 +336,15 @@ def main() -> None:
                 n_skip += 1
                 continue
 
+            # Safe mode (resume): if both outputs already exist, skip without recomputing
+            specimen_out = _specimen_output_dir(args.out, specimen_id)
+            roll_out_path = specimen_out / "attention_rollout.png"
+            grad_out_path = specimen_out / "grad_rollout_similarity_to_specimen.png"
+            if args.resume and roll_out_path.exists() and grad_out_path.exists():
+                n_skip += 1
+                specimen_iter.set_postfix(success=n_ok, skipped=n_skip)
+                continue
+
             z_specimen = torch.from_numpy(embs[sid_to_idx[specimen_id]]).to(device).float()
             z_specimen = F.normalize(z_specimen, dim=0).detach()
 
@@ -324,68 +365,87 @@ def main() -> None:
                 leave=False,
             )
             for col, ip in view_iter:
-                x = load_image_tensor(ip, transform).unsqueeze(0).to(device)
-                x.requires_grad_(True)
-                _reset_block_attn_cache(rollout_blocks)
+                try:
+                    x = load_image_tensor(ip, transform).unsqueeze(0).to(device)
+                    x.requires_grad_(True)
+                    _reset_block_attn_cache(rollout_blocks)
 
-                for p in model.parameters():
-                    p.requires_grad_(False)
+                    for p in model.parameters():
+                        p.requires_grad_(False)
 
-                model.zero_grad(set_to_none=True)
-                z_view = forward_embedding(model, x, enable_grad=True)
-                z_view = F.normalize(z_view, dim=-1)
-                score = F.cosine_similarity(z_view, z_specimen.unsqueeze(0), dim=-1).sum()
-                score.backward()
+                    model.zero_grad(set_to_none=True)
+                    z_view = forward_embedding(model, x, enable_grad=True)
+                    z_view = F.normalize(z_view, dim=-1)
+                    score = F.cosine_similarity(z_view, z_specimen.unsqueeze(0), dim=-1).sum()
+                    score.backward()
+                    if args.strict_sync and device.type == "cuda":
+                        torch.cuda.synchronize(device)
 
-                attn_maps: list[torch.Tensor] = []
-                attn_grads: list[torch.Tensor] = []
-                for blk in rollout_blocks:
-                    attn_map = getattr(blk.attn, "_last_attn_map", None)
-                    if attn_map is None:
+                    attn_maps: list[torch.Tensor] = []
+                    attn_grads: list[torch.Tensor] = []
+                    for blk in rollout_blocks:
+                        attn_map = getattr(blk.attn, "_last_attn_map", None)
+                        if attn_map is None:
+                            continue
+
+                        attn_grad = getattr(blk.attn, "_last_attn_grad", None)
+                        if attn_grad is None and getattr(attn_map, "grad", None) is not None:
+                            attn_grad = attn_map.grad
+                        if attn_grad is None:
+                            attn_grad = torch.zeros_like(attn_map)
+
+                        attn_maps.append(attn_map)
+                        attn_grads.append(attn_grad)
+
+                    if not attn_maps:
+                        LOGGER.warning("No attention tensor extracted for view: %s. Skipping this view.", ip)
                         continue
 
-                    attn_grad = getattr(blk.attn, "_last_attn_grad", None)
-                    if attn_grad is None and getattr(attn_map, "grad", None) is not None:
-                        attn_grad = attn_map.grad
-                    if attn_grad is None:
-                        attn_grad = torch.zeros_like(attn_map)
+                    roll = attention_rollout(attn_maps)
+                    grad_roll = grad_attention_rollout(attn_maps, attn_grads)
 
-                    attn_maps.append(attn_map)
-                    attn_grads.append(attn_grad)
+                    # Derive the patch count from the attention matrix size T (excluding CLS+register)
+                    n_total_tokens = int(attn_maps[0].shape[-1])
+                    num_patches = n_total_tokens - num_prefix_tokens
 
-                if not attn_maps:
-                    LOGGER.warning("No attention tensor extracted for view: %s. Skipping this view.", ip)
-                    continue
+                    roll_tokens = _cls_to_patch_tokens(roll[0], num_patches, ip)
+                    grad_tokens = _cls_to_patch_tokens(grad_roll[0], num_patches, ip)
+                    grid = _infer_grid_size(int(roll_tokens.shape[-1]), ip)
 
-                roll = attention_rollout(attn_maps)
-                grad_roll = grad_attention_rollout(attn_maps, attn_grads)
+                    heat = to_patch_heatmap(roll_tokens, grid)
+                    gheat = to_patch_heatmap(grad_tokens, grid)
 
-                # attention行列のサイズ T からpatch数を算出（CLS+registerを除外）
-                n_total_tokens = int(attn_maps[0].shape[-1])
-                num_patches = n_total_tokens - num_prefix_tokens
+                    img = plt.imread(ip)
+                    axs_roll[0, col].imshow(img)
+                    axs_roll[0, col].set_title(Path(ip).name)
+                    axs_roll[0, col].axis("off")
+                    axs_roll[1, col].imshow(img)
+                    axs_roll[1, col].imshow(heat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                    axs_roll[1, col].axis("off")
 
-                roll_tokens = _cls_to_patch_tokens(roll[0], num_patches, ip)
-                grad_tokens = _cls_to_patch_tokens(grad_roll[0], num_patches, ip)
-                grid = _infer_grid_size(int(roll_tokens.shape[-1]), ip)
+                    axs_grad[0, col].imshow(img)
+                    axs_grad[0, col].set_title(Path(ip).name)
+                    axs_grad[0, col].axis("off")
+                    axs_grad[1, col].imshow(img)
+                    axs_grad[1, col].imshow(gheat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                    axs_grad[1, col].axis("off")
+                    success_cols += 1
 
-                heat = to_patch_heatmap(roll_tokens, grid)
-                gheat = to_patch_heatmap(grad_tokens, grid)
-
-                img = plt.imread(ip)
-                axs_roll[0, col].imshow(img)
-                axs_roll[0, col].set_title(Path(ip).name)
-                axs_roll[0, col].axis("off")
-                axs_roll[1, col].imshow(img)
-                axs_roll[1, col].imshow(heat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
-                axs_roll[1, col].axis("off")
-
-                axs_grad[0, col].imshow(img)
-                axs_grad[0, col].set_title(Path(ip).name)
-                axs_grad[0, col].axis("off")
-                axs_grad[1, col].imshow(img)
-                axs_grad[1, col].imshow(gheat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
-                axs_grad[1, col].axis("off")
-                success_cols += 1
+                    # Safe mode: explicitly free the large per-view tensors to keep the VRAM peak at ~one view
+                    del x, z_view, score, attn_maps, attn_grads, roll, grad_roll
+                    del roll_tokens, grad_tokens, heat, gheat, img
+                except torch.cuda.OutOfMemoryError:
+                    # OOM is recoverable: give up only this view, free the cache, and keep going
+                    LOGGER.warning(
+                        "Out of VRAM; skipping view: %s. If this happens often, reduce --num-show or "
+                        "lower --image-size/--crop-size.",
+                        ip,
+                    )
+                finally:
+                    # Reliably drop attention-map references between views and free the cache to prevent hangs
+                    _reset_block_attn_cache(rollout_blocks)
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
             if success_cols == 0:
                 LOGGER.warning(
@@ -400,15 +460,24 @@ def main() -> None:
             fig_roll.tight_layout()
             fig_grad.tight_layout()
 
-            specimen_out = _specimen_output_dir(args.out, specimen_id)
             ensure_dir(specimen_out)
-            fig_roll.savefig(specimen_out / "attention_rollout.png", dpi=220)
-            fig_grad.savefig(specimen_out / "grad_rollout_similarity_to_specimen.png", dpi=220)
+            fig_roll.savefig(roll_out_path, dpi=220)
+            fig_grad.savefig(grad_out_path, dpi=220)
             plt.close(fig_roll)
             plt.close(fig_grad)
             n_ok += 1
             LOGGER.info("Saved ViT attention explanations for %s to %s", specimen_id, specimen_out)
-            specimen_iter.set_postfix(success=n_ok, skipped=n_skip)
+
+            # Safe mode: record and free the VRAM peak, and wait for cool-down if requested
+            postfix: dict[str, Any] = {"success": n_ok, "skipped": n_skip}
+            if device.type == "cuda":
+                peak_gb = torch.cuda.max_memory_allocated(device) / 1024**3
+                postfix["peak_gb"] = round(peak_gb, 2)
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.empty_cache()
+            specimen_iter.set_postfix(**postfix)
+            if args.cooldown > 0:
+                time.sleep(args.cooldown)
     finally:
         _restore_attention_wrappers(restore_state)
 
@@ -421,4 +490,25 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except torch.cuda.OutOfMemoryError as exc:
+        LOGGER.error(
+            "Aborted due to out of VRAM (%s). Re-run with --resume (default) to continue from where it stopped. "
+            "If it persists, reduce --num-show or set --vram-fraction 0.9 to cap memory.",
+            exc,
+        )
+        sys.exit(2)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "cuda" in msg or "device-side" in msg or "out of memory" in msg:
+            # A corrupted CUDA context (e.g. unknown error) cannot be recovered in-process; exit safely and let the restart loop take over
+            LOGGER.error(
+                "Aborted due to a fatal GPU error (%s). The CUDA context is corrupted, so exiting safely. "
+                "Re-run with --resume (default) to continue from where it stopped. If it recurs, use "
+                "scripts/run_safe.sh (auto-restart loop), cap the GPU power (nvidia-smi -pl), and set "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+                exc,
+            )
+            sys.exit(1)
+        raise

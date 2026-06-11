@@ -15,7 +15,7 @@ DINOV3_MEAN = (0.485, 0.456, 0.406)
 DINOV3_STD = (0.229, 0.224, 0.225)
 MODEL_ALIASES = {
     "dinov3_vits16": "vit_small_patch16_dinov3.lvd1689m",
-    "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",  # デフォルト
+    "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",  # default
     "dinov3_vitl16": "vit_large_patch16_dinov3.lvd1689m",
 }
 

@@ -44,6 +44,52 @@ python -m src.explain_vit_attention \
   --num-show 12
 ```
 
+## Safe execution (high-resolution / long runs)
+High-resolution settings (e.g. `--image-size 768`) make this pass VRAM-heavy:
+attention maps are materialized explicitly (fused attention is disabled so the
+maps can be captured), so the peak can approach the GPU limit. On memory-limited
+GPUs this may cause CUDA crashes or full system hangs. The options below make
+long runs robust **without lowering the resolution**:
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `--resume` / `--no-resume` | `--resume` | Skip specimens whose two output PNGs already exist (resume after a crash). |
+| `--cooldown SECONDS` | `0` | Sleep after each specimen to let the GPU cool down (thermal / power-spike relief). |
+| `--vram-fraction F` | off | Cap process VRAM to fraction `F` (0–1); exceeding it raises OOM instead of hanging. |
+| `--strict-sync` | off | `cuda.synchronize()` after each view to surface CUDA errors at their true location. |
+
+Example — a manual run that keeps the 768px settings and adds the safety options:
+
+```bash
+python -m src.explain_vit_attention \
+  --renders data/renders \
+  --emb data/embeddings/embeddings.npy \
+  --ids data/embeddings/ids.txt \
+  --out results/explain \
+  --image-size 768 \
+  --crop-size 768 \
+  --num-show 12 \
+  --resume \
+  --cooldown 5 \
+  --vram-fraction 0.9
+```
+
+Per-view tensors are now freed and `torch.cuda.empty_cache()` runs between views,
+keeping the VRAM peak near a single view's footprint; the peak (GB) is shown in
+the progress bar. Out-of-memory on one view is caught and that view is skipped.
+
+For unattended runs, use the auto-restart wrapper, which relaunches the process
+(resuming where it stopped) if the GPU crashes — a corrupted CUDA context cannot
+be recovered in-process, so restarting is the only reliable recovery:
+
+```bash
+bash scripts/run_safe.sh
+```
+
+It also exports `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce
+fragmentation. To guard against power-spike blackouts, also consider capping the
+GPU power limit on the host (e.g. `nvidia-smi -pl 200`).
+
 ## Outputs
 For each specimen, the tool writes attention-visualization artifacts such as:
 - `attention_rollout.png`
