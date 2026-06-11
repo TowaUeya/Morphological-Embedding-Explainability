@@ -44,7 +44,7 @@ while :; do
   attempt=$((attempt + 1))
   echo "[run_safe] ===== attempt #${attempt} $(date '+%Y-%m-%d %H:%M:%S') ====="
 
-  python -m src.explain_vit_attention \
+  python3 -m src.explain_vit_attention \
     --renders "${RENDERS}" \
     --emb "${EMB}" \
     --ids "${IDS}" \
