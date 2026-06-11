@@ -35,9 +35,9 @@ Run explainability visualization with:
 
 ```bash
 python -m src.explain_vit_attention \
-  --renders data/renders \
-  --emb data/embeddings/embeddings.npy \
-  --ids data/embeddings/ids.txt \
+  --renders ../MultiView3D-DINOv2/data/renders \
+  --emb ../MultiView3D-DINOv2/data/embeddings/embeddings.npy \
+  --ids ../MultiView3D-DINOv2/data/embeddings/ids.txt \
   --out results/explain \
   --image-size 768 \
   --crop-size 768 \
