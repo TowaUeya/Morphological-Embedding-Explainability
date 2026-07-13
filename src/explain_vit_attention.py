@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -282,6 +282,169 @@ def _infer_grid_size(n_patches: int, image_path: Path) -> int:
 
 
 _MISSING = object()
+
+
+def explain_specimens(
+    model: torch.nn.Module,
+    target_specimen_ids: list[str],
+    grouped: dict[str, list[Path]],
+    get_specimen_embedding: Callable[[str], torch.Tensor | None],
+    transform: Any,
+    out: Path,
+    *,
+    layers: str = "all",
+    num_show: int = 6,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Render attention/grad-rollout figures for each target specimen.
+
+    ``get_specimen_embedding(sid)`` returns the grad-rollout REFERENCE embedding
+    (a normalized, detached ``[D]`` tensor on ``device``) or ``None`` to skip that
+    specimen. Decoupling the embedding source from the rollout machinery lets the
+    frozen tool pass stored ``embeddings.npy`` vectors while the out-of-scope
+    fine-tuning experiment (``experiments/explain_finetuned.py``) passes vectors
+    recomputed with the SAME fine-tuned model, so grad-rollout is not a
+    frozen/fine-tuned hybrid. Returns ``(n_ok, n_skip)``; raises if nothing saved.
+    """
+    if num_show < 1:
+        raise ValueError("--num-show must be >= 1")
+
+    blocks = _collect_blocks(model)
+    rollout_blocks = _select_blocks_for_rollout(blocks, layers)
+    restore_state = _install_attention_wrappers(rollout_blocks)
+    # DINOv3 has CLS+register tokens. patch_embed.num_patches is fixed to the
+    # training-time default resolution and does not match the actual resolution,
+    # so derive num_patches = T - num_prefix_tokens dynamically from the actual token count T.
+    num_prefix_tokens = int(getattr(model, "num_prefix_tokens", 1))
+
+    n_ok = 0
+    n_skip = 0
+    try:
+        specimen_iter = tqdm(target_specimen_ids, desc="Specimens", unit="specimen")
+        for specimen_id in specimen_iter:
+            if specimen_id not in grouped:
+                LOGGER.warning("Skipping %s: specimen_id not found in renders.", specimen_id)
+                n_skip += 1
+                continue
+
+            z_specimen = get_specimen_embedding(specimen_id)
+            if z_specimen is None:
+                LOGGER.warning("Skipping %s: no reference embedding available.", specimen_id)
+                n_skip += 1
+                continue
+
+            image_paths = grouped[specimen_id]
+            n_show = min(num_show, len(image_paths))
+
+            fig_w = max(4.0 * n_show, 8.0)
+            fig_h = 8.0
+            fig_roll, axs_roll = plt.subplots(2, n_show, figsize=(fig_w, fig_h), squeeze=False)
+            fig_grad, axs_grad = plt.subplots(2, n_show, figsize=(fig_w, fig_h), squeeze=False)
+
+            success_cols = 0
+            view_iter = tqdm(
+                enumerate(image_paths[:n_show]),
+                total=n_show,
+                desc=f"Views ({specimen_id})",
+                unit="view",
+                leave=False,
+            )
+            for col, ip in view_iter:
+                x = load_image_tensor(ip, transform).unsqueeze(0).to(device)
+                x.requires_grad_(True)
+                _reset_block_attn_cache(rollout_blocks)
+
+                for p in model.parameters():
+                    p.requires_grad_(False)
+
+                model.zero_grad(set_to_none=True)
+                z_view = forward_embedding(model, x, enable_grad=True)
+                z_view = F.normalize(z_view, dim=-1)
+                score = F.cosine_similarity(z_view, z_specimen.unsqueeze(0), dim=-1).sum()
+                score.backward()
+
+                attn_maps: list[torch.Tensor] = []
+                attn_grads: list[torch.Tensor] = []
+                for blk in rollout_blocks:
+                    attn_map = getattr(blk.attn, "_last_attn_map", None)
+                    if attn_map is None:
+                        continue
+
+                    attn_grad = getattr(blk.attn, "_last_attn_grad", None)
+                    if attn_grad is None and getattr(attn_map, "grad", None) is not None:
+                        attn_grad = attn_map.grad
+                    if attn_grad is None:
+                        attn_grad = torch.zeros_like(attn_map)
+
+                    attn_maps.append(attn_map)
+                    attn_grads.append(attn_grad)
+
+                if not attn_maps:
+                    LOGGER.warning("No attention tensor extracted for view: %s. Skipping this view.", ip)
+                    continue
+
+                roll = attention_rollout(attn_maps)
+                grad_roll = grad_attention_rollout(attn_maps, attn_grads)
+
+                # Derive the patch count from the attention matrix size T (excluding CLS+register).
+                n_total_tokens = int(attn_maps[0].shape[-1])
+                num_patches = n_total_tokens - num_prefix_tokens
+
+                roll_tokens = _cls_to_patch_tokens(roll[0], num_patches, ip)
+                grad_tokens = _cls_to_patch_tokens(grad_roll[0], num_patches, ip)
+                grid = _infer_grid_size(int(roll_tokens.shape[-1]), ip)
+
+                heat = to_patch_heatmap(roll_tokens, grid)
+                gheat = to_patch_heatmap(grad_tokens, grid)
+
+                img = plt.imread(ip)
+                axs_roll[0, col].imshow(img)
+                axs_roll[0, col].set_title(Path(ip).name)
+                axs_roll[0, col].axis("off")
+                axs_roll[1, col].imshow(img)
+                axs_roll[1, col].imshow(heat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                axs_roll[1, col].axis("off")
+
+                axs_grad[0, col].imshow(img)
+                axs_grad[0, col].set_title(Path(ip).name)
+                axs_grad[0, col].axis("off")
+                axs_grad[1, col].imshow(img)
+                axs_grad[1, col].imshow(gheat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                axs_grad[1, col].axis("off")
+                success_cols += 1
+
+            if success_cols == 0:
+                LOGGER.warning(
+                    "Skipping %s: no valid attention map extracted for any view. ",
+                    specimen_id,
+                )
+                plt.close(fig_roll)
+                plt.close(fig_grad)
+                n_skip += 1
+                continue
+
+            fig_roll.tight_layout()
+            fig_grad.tight_layout()
+
+            specimen_out = _specimen_output_dir(out, specimen_id)
+            ensure_dir(specimen_out)
+            fig_roll.savefig(specimen_out / "attention_rollout.png", dpi=220)
+            fig_grad.savefig(specimen_out / "grad_rollout_similarity_to_specimen.png", dpi=220)
+            plt.close(fig_roll)
+            plt.close(fig_grad)
+            n_ok += 1
+            LOGGER.info("Saved ViT attention explanations for %s to %s", specimen_id, specimen_out)
+            specimen_iter.set_postfix(success=n_ok, skipped=n_skip)
+    finally:
+        _restore_attention_wrappers(restore_state)
+
+    if n_ok == 0:
+        raise RuntimeError(
+            "No valid attention maps were saved for any specimen. Please check timm version/model attention outputs."
+        )
+
+    LOGGER.info("Completed ViT attention explanation. success=%d skipped=%d", n_ok, n_skip)
+    return n_ok, n_skip
 
 
 def main() -> None:
