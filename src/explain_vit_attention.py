@@ -18,7 +18,11 @@ from tqdm.auto import tqdm
 
 from src.utils.explain import attention_rollout, grad_attention_rollout, to_patch_heatmap
 from src.utils.io import ensure_dir, group_renders_by_specimen, list_image_files, load_ids
-from src.utils.vision import build_transform, forward_embedding, load_dinov3_model, load_image_tensor, resolve_device
+from src.utils.upsampling import add_guided_upsampling_args, guided_output_suffix, guided_upsample
+from src.utils.vision import (
+    build_transform, forward_embedding, image_tensor_to_rgb,
+    load_dinov3_model, load_image_tensor, resolve_device,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--crop-size", type=int, default=224)
     p.add_argument("--layers", type=str, choices=("all", "last"), default="all")
+    add_guided_upsampling_args(p)
     p.add_argument(
         "--num-show",
         type=int,
@@ -284,6 +289,25 @@ def _infer_grid_size(n_patches: int, image_path: Path) -> int:
 _MISSING = object()
 
 
+def _prepare_rollout_overlay(
+    image_path: Path,
+    model_input: torch.Tensor,
+    *heatmaps: np.ndarray,
+    guided_upsampling: bool = False,
+    guided_radius: int = 1,
+    guided_eps: float = 1e-3,
+) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+    if not guided_upsampling:
+        return plt.imread(image_path), heatmaps
+    # Use the exact input crop for BOTH guidance and display. Stretching a map
+    # over the uncropped original would incorrectly align attention with edges.
+    image = image_tensor_to_rgb(model_input)
+    return image, tuple(
+        guided_upsample(heat, image, radius=guided_radius, eps=guided_eps)
+        for heat in heatmaps
+    )
+
+
 def explain_specimens(
     model: torch.nn.Module,
     target_specimen_ids: list[str],
@@ -295,6 +319,9 @@ def explain_specimens(
     layers: str = "all",
     num_show: int = 6,
     device: torch.device,
+    guided_upsampling: bool = False,
+    guided_radius: int = 1,
+    guided_eps: float = 1e-3,
 ) -> tuple[int, int]:
     """Render attention/grad-rollout figures for each target specimen.
 
@@ -308,6 +335,8 @@ def explain_specimens(
     """
     if num_show < 1:
         raise ValueError("--num-show must be >= 1")
+    output_suffix = guided_output_suffix(guided_upsampling, guided_radius, guided_eps)
+    heatmap_range = {"vmin": 0, "vmax": 1} if guided_upsampling else {}
 
     blocks = _collect_blocks(model)
     rollout_blocks = _select_blocks_for_rollout(blocks, layers)
@@ -397,19 +426,23 @@ def explain_specimens(
                 heat = to_patch_heatmap(roll_tokens, grid)
                 gheat = to_patch_heatmap(grad_tokens, grid)
 
-                img = plt.imread(ip)
+                img, (heat, gheat) = _prepare_rollout_overlay(
+                    ip, x[0], heat, gheat,
+                    guided_upsampling=guided_upsampling,
+                    guided_radius=guided_radius, guided_eps=guided_eps,
+                )
                 axs_roll[0, col].imshow(img)
                 axs_roll[0, col].set_title(Path(ip).name)
                 axs_roll[0, col].axis("off")
                 axs_roll[1, col].imshow(img)
-                axs_roll[1, col].imshow(heat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                axs_roll[1, col].imshow(heat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0), **heatmap_range)
                 axs_roll[1, col].axis("off")
 
                 axs_grad[0, col].imshow(img)
                 axs_grad[0, col].set_title(Path(ip).name)
                 axs_grad[0, col].axis("off")
                 axs_grad[1, col].imshow(img)
-                axs_grad[1, col].imshow(gheat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                axs_grad[1, col].imshow(gheat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0), **heatmap_range)
                 axs_grad[1, col].axis("off")
                 success_cols += 1
 
@@ -428,8 +461,8 @@ def explain_specimens(
 
             specimen_out = _specimen_output_dir(out, specimen_id)
             ensure_dir(specimen_out)
-            fig_roll.savefig(specimen_out / "attention_rollout.png", dpi=220)
-            fig_grad.savefig(specimen_out / "grad_rollout_similarity_to_specimen.png", dpi=220)
+            fig_roll.savefig(specimen_out / f"attention_rollout{output_suffix}.png", dpi=220)
+            fig_grad.savefig(specimen_out / f"grad_rollout_similarity_to_specimen{output_suffix}.png", dpi=220)
             plt.close(fig_roll)
             plt.close(fig_grad)
             n_ok += 1
@@ -450,6 +483,8 @@ def explain_specimens(
 def main() -> None:
     args = parse_args()
     ensure_dir(args.out)
+    output_suffix = guided_output_suffix(args.guided_upsampling, args.guided_radius, args.guided_eps)
+    heatmap_range = {"vmin": 0, "vmax": 1} if args.guided_upsampling else {}
 
     device = resolve_device(args.device)
     model = load_dinov3_model(args.model, device)
@@ -487,6 +522,7 @@ def main() -> None:
 
     n_ok = 0
     n_skip = 0
+    n_resumed = 0
     try:
         specimen_iter = tqdm(target_specimen_ids, desc="Specimens", unit="specimen")
         for specimen_id in specimen_iter:
@@ -501,10 +537,11 @@ def main() -> None:
 
             # Safe mode (resume): if both outputs already exist, skip without recomputing
             specimen_out = _specimen_output_dir(args.out, specimen_id)
-            roll_out_path = specimen_out / "attention_rollout.png"
-            grad_out_path = specimen_out / "grad_rollout_similarity_to_specimen.png"
+            roll_out_path = specimen_out / f"attention_rollout{output_suffix}.png"
+            grad_out_path = specimen_out / f"grad_rollout_similarity_to_specimen{output_suffix}.png"
             if args.resume and roll_out_path.exists() and grad_out_path.exists():
                 n_skip += 1
+                n_resumed += 1
                 specimen_iter.set_postfix(success=n_ok, skipped=n_skip)
                 continue
 
@@ -578,19 +615,23 @@ def main() -> None:
                     heat = to_patch_heatmap(roll_tokens, grid)
                     gheat = to_patch_heatmap(grad_tokens, grid)
 
-                    img = plt.imread(ip)
+                    img, (heat, gheat) = _prepare_rollout_overlay(
+                        ip, x[0], heat, gheat,
+                        guided_upsampling=args.guided_upsampling,
+                        guided_radius=args.guided_radius, guided_eps=args.guided_eps,
+                    )
                     axs_roll[0, col].imshow(img)
                     axs_roll[0, col].set_title(Path(ip).name)
                     axs_roll[0, col].axis("off")
                     axs_roll[1, col].imshow(img)
-                    axs_roll[1, col].imshow(heat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                    axs_roll[1, col].imshow(heat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0), **heatmap_range)
                     axs_roll[1, col].axis("off")
 
                     axs_grad[0, col].imshow(img)
                     axs_grad[0, col].set_title(Path(ip).name)
                     axs_grad[0, col].axis("off")
                     axs_grad[1, col].imshow(img)
-                    axs_grad[1, col].imshow(gheat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0))
+                    axs_grad[1, col].imshow(gheat, cmap="jet", alpha=0.45, extent=(0, img.shape[1], img.shape[0], 0), **heatmap_range)
                     axs_grad[1, col].axis("off")
                     success_cols += 1
 
@@ -644,7 +685,7 @@ def main() -> None:
     finally:
         _restore_attention_wrappers(restore_state)
 
-    if n_ok == 0:
+    if n_ok == 0 and n_resumed == 0:
         raise RuntimeError(
             "No valid attention maps were saved for any specimen. Please check timm version/model attention outputs."
         )

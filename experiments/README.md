@@ -90,6 +90,9 @@ python -m experiments.explain_finetuned \
 | `--out` | (required) | output directory |
 | `--specimen_id` | all | target specimen; if omitted, every specimen under `--renders` is processed |
 | `--layers` | `all` | rollout source: `all` blocks or `last` block only |
+| `--guided-upsampling` | off | RGB-guided upsampling of both heatmaps to model input resolution |
+| `--guided-radius` | `1` | guided-filter radius in patch cells (≥ 1) |
+| `--guided-eps` | `0.001` | positive regularization for RGB guidance in [0,1] |
 | `--num-show` | `6` | number of views to render per specimen |
 | `--image-size` | = fine-tune | override; defaults to `summary.json` (avoids a train/eval distribution shift) |
 | `--crop-size` | = fine-tune | override; defaults to `summary.json` |
@@ -105,6 +108,11 @@ Per specimen:
   view-to-specimen similarity score.
 
 Plus `provenance.json`, which records the adapter, config, and resolution used.
+It also records guided upsampling settings. With `--guided-upsampling`, PNG
+filenames gain `_guided_r1_eps0.001` (using the selected radius/epsilon) before
+`.png`; ordinary outputs are kept separately. Guidance and display use the exact
+resized/center-cropped input. See [Guided upsampling](../README.md#guided-upsampling)
+for an example and interpretation notes.
 
 ---
 
@@ -139,6 +147,9 @@ python -m experiments.compare_rollout \
 | `--specimen_id` | first held-out | target specimen; default = first held-out specimen present under `--renders` |
 | `--num-show` | `6` | number of views to render |
 | `--layers` | `all` | rollout source: `all` blocks or `last` block only |
+| `--guided-upsampling` | off | apply the same RGB-guided upsampling to both models before computing the difference |
+| `--guided-radius` | `1` | guided-filter radius in patch cells (≥ 1) |
+| `--guided-eps` | `0.001` | positive regularization for RGB guidance in [0,1] |
 | `--image-size` | = fine-tune | override; defaults to `summary.json` |
 | `--crop-size` | = fine-tune | override; defaults to `summary.json` |
 | `--batch-size` | `16` | batch size for reference-embedding extraction |
@@ -149,6 +160,10 @@ python -m experiments.compare_rollout \
 - `{specimen_id}_grad_rollout_diff.png` — the 4-row view / frozen / fine-tuned / diff
   figure. Each heatmap is min-max normalized to [0,1], so the diff row shows a
   **relative** shift in attention, not an absolute one.
+
+With `--guided-upsampling`, the filename gains `_guided_r1_eps0.001` (using the
+selected values). The difference and logged statistics then describe the
+upsampled, clipped maps at input resolution, with no further normalization.
 
 ---
 

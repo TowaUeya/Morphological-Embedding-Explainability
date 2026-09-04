@@ -44,6 +44,49 @@ python -m src.explain_vit_attention \
   --num-show 12
 ```
 
+### Guided upsampling
+
+Add `--guided-upsampling` to produce RGB-guided, input-resolution heatmaps for
+both attention rollout and gradient-weighted attention rollout:
+
+```bash
+python -m src.explain_vit_attention \
+  --renders data/renders \
+  --emb data/embeddings/embeddings.npy \
+  --ids data/embeddings/ids.txt \
+  --out results/explain \
+  --image-size 768 --crop-size 768 --num-show 12 \
+  --guided-upsampling --guided-radius 1 --guided-eps 0.001
+```
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `--guided-upsampling` | off | Enable RGB-guided joint upsampling for both heatmaps. |
+| `--guided-radius` | `1` | Local window radius in **patch cells**, not pixels; `1` uses a 3×3 patch window. Must be ≥ 1. |
+| `--guided-eps` | `0.001` | Positive regularization for RGB values in [0,1]. Larger values reduce the influence of image edges. |
+
+This uses the joint upsampling procedure from
+[He et al., Guided Image Filtering](https://people.csail.mit.edu/kaiming/eccv10/index.html):
+fit local linear coefficients on the patch grid, bilinearly upsample the
+coefficients, and evaluate against the RGB input. Guidance and overlay backgrounds
+use the exact resized/center-cropped model input, so edges remain aligned even
+for non-square source images. Output heatmaps have `crop_size × crop_size` pixels.
+The filter runs on the CPU and requires no additional dependencies.
+
+Guided outputs have a settings suffix, for example
+`attention_rollout_guided_r1_eps0.001.png` and
+`grad_rollout_similarity_to_specimen_guided_r1_eps0.001.png`. This keeps them
+alongside ordinary outputs and makes `--resume` distinguish guided settings.
+Use `--no-resume` or a new `--out` directory when changing other settings such as
+resolution, layers, model, or selected views. Without `--guided-upsampling`,
+the existing rendering and filenames are retained.
+
+The same options are available in `experiments.explain_finetuned` and
+`experiments.compare_rollout`. Upsampling is visualization postprocessing;
+fine edge structure comes from the RGB guide and does not add evidence of
+pixel-level model attribution. Values are clipped to [0,1] after filtering,
+without another min-max normalization.
+
 ## Safe execution (high-resolution / long runs)
 High-resolution settings (e.g. `--image-size 768`) make this pass VRAM-heavy:
 attention maps are materialized explicitly (fused attention is disabled so the
@@ -84,6 +127,12 @@ be recovered in-process, so restarting is the only reliable recovery:
 
 ```bash
 bash scripts/run_safe.sh
+```
+
+To enable guided upsampling through the wrapper:
+
+```bash
+GUIDED_UPSAMPLING=1 GUIDED_RADIUS=1 GUIDED_EPS=0.001 bash scripts/run_safe.sh
 ```
 
 It also exports `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce

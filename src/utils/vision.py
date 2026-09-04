@@ -45,6 +45,12 @@ def load_image_tensor(image_path: Path, transform: transforms.Compose) -> torch.
         return transform(img.convert("RGB"))
 
 
+def image_tensor_to_rgb(image: torch.Tensor) -> np.ndarray:
+    """Recover RGB from a normalized CHW model input, preserving resize/crop alignment."""
+    image = image.detach().cpu().float().permute(1, 2, 0).numpy()
+    return np.clip(image * np.asarray(DINOV3_STD) + np.asarray(DINOV3_MEAN), 0, 1).astype(np.float32)
+
+
 def l2_normalize(array: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     norm = np.linalg.norm(array, axis=-1, keepdims=True)
     return array / np.maximum(norm, eps)

@@ -52,6 +52,7 @@ import torch.nn.functional as F
 from experiments._finetune_utils import _LORA_TARGET_SETS, extract_specimen_embeddings, inject_lora
 from src.explain_vit_attention import explain_specimens
 from src.utils.io import ensure_dir, group_renders_by_specimen, list_image_files, setup_logging
+from src.utils.upsampling import add_guided_upsampling_args
 from src.utils.vision import build_transform, load_dinov3_model, resolve_device
 
 LOGGER = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ def parse_args() -> argparse.Namespace:
         help="Target specimen ID. If omitted, all specimens found under --renders are processed.",
     )
     p.add_argument("--layers", type=str, choices=("all", "last"), default="all")
+    add_guided_upsampling_args(p)
     p.add_argument("--num-show", type=int, default=6)
     # Resolution defaults to summary.json (same as training); override only to experiment.
     p.add_argument("--image-size", type=int, default=None, help="override; default = fine-tune image_size")
@@ -188,6 +190,9 @@ def main() -> None:
             "image_size": image_size,
             "crop_size": crop_size,
             "layers": args.layers,
+            "guided_upsampling": args.guided_upsampling,
+            "guided_radius": args.guided_radius,
+            "guided_eps": args.guided_eps,
             "num_show": args.num_show,
             "n_target_specimens": len(in_renders),
         },
@@ -205,6 +210,9 @@ def main() -> None:
         layers=args.layers,
         num_show=args.num_show,
         device=device,
+        guided_upsampling=args.guided_upsampling,
+        guided_radius=args.guided_radius,
+        guided_eps=args.guided_eps,
     )
     LOGGER.info("done: success=%d skipped=%d -> %s", n_ok, n_skip, args.out)
 

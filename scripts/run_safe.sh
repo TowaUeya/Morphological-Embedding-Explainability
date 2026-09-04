@@ -36,6 +36,14 @@ COOLDOWN="${COOLDOWN:-5}"         # cool-down seconds after each specimen (therm
 #   last : capture only the final block (~2.45GB peak). Guaranteed-fit fallback if `all` keeps OOMing:
 #          run  LAYERS=last bash scripts/run_safe.sh
 LAYERS="${LAYERS:-all}"
+# Optional RGB-guided heatmap upsampling (radius is in patch cells).
+GUIDED_UPSAMPLING="${GUIDED_UPSAMPLING:-0}"
+GUIDED_RADIUS="${GUIDED_RADIUS:-1}"
+GUIDED_EPS="${GUIDED_EPS:-0.001}"
+guided_args=(--guided-radius "${GUIDED_RADIUS}" --guided-eps "${GUIDED_EPS}")
+if [ "${GUIDED_UPSAMPLING}" = "1" ]; then
+  guided_args+=(--guided-upsampling)
+fi
 # Cap process VRAM to this fraction of TOTAL memory; exceeding it raises a clean OOM instead of hanging.
 # 0.93 is the practical maximum for an 11GB card: 0.93*11264MiB ~= 10475MiB, still just under the
 # ~10.5GB that the desktop (Xwayland) leaves free, so the process gets the most headroom possible
@@ -66,7 +74,8 @@ while :; do
     --layers "${LAYERS}" \
     --resume \
     --cooldown "${COOLDOWN}" \
-    --vram-fraction "${VRAM_FRACTION}"
+    --vram-fraction "${VRAM_FRACTION}" \
+    "${guided_args[@]}"
 
   code=$?
   if [ "${code}" -eq 0 ]; then

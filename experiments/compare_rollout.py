@@ -52,9 +52,11 @@ from src.explain_vit_attention import (
 )
 from src.utils.explain import grad_attention_rollout, to_patch_heatmap
 from src.utils.io import ensure_dir, group_renders_by_specimen, list_image_files, setup_logging
+from src.utils.upsampling import add_guided_upsampling_args, guided_output_suffix, guided_upsample
 from src.utils.vision import (
     build_transform,
     forward_embedding,
+    image_tensor_to_rgb,
     load_dinov3_model,
     load_image_tensor,
     resolve_device,
@@ -74,6 +76,7 @@ def parse_args() -> argparse.Namespace:
                    help="default: first held-out specimen present under --renders")
     p.add_argument("--num-show", type=int, default=6)
     p.add_argument("--layers", type=str, choices=("all", "last"), default="all")
+    add_guided_upsampling_args(p)
     p.add_argument("--image-size", type=int, default=None, help="override; default = fine-tune image_size")
     p.add_argument("--crop-size", type=int, default=None, help="override; default = fine-tune crop_size")
     p.add_argument("--batch-size", type=int, default=16)
@@ -81,7 +84,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def grad_rollout_heatmaps(model, z_specimen, paths, transform, layers, device):
+def grad_rollout_heatmaps(
+    model, z_specimen, paths, transform, layers, device,
+    *, guided_upsampling=False, guided_radius=1, guided_eps=1e-3,
+):
     """Per-view grad-rollout heatmaps (normalized to [0,1]). Identical to explain_specimens' per-view computation."""
     blocks = _select_blocks_for_rollout(_collect_blocks(model), layers)
     restore = _install_attention_wrappers(blocks)
@@ -111,7 +117,12 @@ def grad_rollout_heatmaps(model, z_specimen, paths, transform, layers, device):
             gr = grad_attention_rollout(amaps, agrads)
             n_patch = int(amaps[0].shape[-1]) - num_prefix
             gt = _cls_to_patch_tokens(gr[0], n_patch, ip)
-            heats.append(to_patch_heatmap(gt, _infer_grid_size(int(gt.shape[-1]), ip)))
+            heat = to_patch_heatmap(gt, _infer_grid_size(int(gt.shape[-1]), ip))
+            if guided_upsampling:
+                heat = guided_upsample(
+                    heat, image_tensor_to_rgb(x[0]), radius=guided_radius, eps=guided_eps,
+                )
+            heats.append(heat)
     finally:
         _restore_attention_wrappers(restore)
     return heats
@@ -163,25 +174,33 @@ def main() -> None:
                 sid, image_size, len(paths), cfg["finetune"])
 
     pm = load_dinov3_model(cfg["model"], device)
+    guided_options = dict(
+        guided_upsampling=args.guided_upsampling,
+        guided_radius=args.guided_radius, guided_eps=args.guided_eps,
+    )
     Hf = grad_rollout_heatmaps(pm, _reference(pm, sid, groups, transform, device, args.batch_size),
-                               paths, transform, args.layers, device)
+                               paths, transform, args.layers, device, **guided_options)
     Ht = grad_rollout_heatmaps(ftm, _reference(ftm, sid, groups, transform, device, args.batch_size),
-                               paths, transform, args.layers, device)
+                               paths, transform, args.layers, device, **guided_options)
 
     n = len(paths)
     fig, axs = plt.subplots(4, n, figsize=(4 * n, 15), squeeze=False)
     row_labels = ["view", "frozen grad-rollout", "fine-tuned grad-rollout", "diff = fine-tuned - frozen"]
     diff_im = None
     stats = []
+    heatmap_range = {"vmin": 0, "vmax": 1} if args.guided_upsampling else {}
     for c, ip in enumerate(paths):
-        img = plt.imread(ip)
+        img = (
+            image_tensor_to_rgb(load_image_tensor(ip, transform))
+            if args.guided_upsampling else plt.imread(ip)
+        )
         ext = (0, img.shape[1], img.shape[0], 0)
         axs[0, c].imshow(img)
         axs[0, c].set_title(Path(ip).name, fontsize=8)
         axs[1, c].imshow(img)
-        axs[1, c].imshow(Hf[c], cmap="jet", alpha=0.45, extent=ext)
+        axs[1, c].imshow(Hf[c], cmap="jet", alpha=0.45, extent=ext, **heatmap_range)
         axs[2, c].imshow(img)
-        axs[2, c].imshow(Ht[c], cmap="jet", alpha=0.45, extent=ext)
+        axs[2, c].imshow(Ht[c], cmap="jet", alpha=0.45, extent=ext, **heatmap_range)
         d = Ht[c] - Hf[c]
         axs[3, c].imshow(img, alpha=0.35)
         diff_im = axs[3, c].imshow(d, cmap="bwr", vmin=-1, vmax=1, alpha=0.75, extent=ext)
@@ -202,7 +221,8 @@ def main() -> None:
         "fine-tuned - frozen (relative attention shift)"
     )
     safe = sid.replace("/", "_")
-    outpath = args.out / f"{safe}_grad_rollout_diff.png"
+    suffix = guided_output_suffix(args.guided_upsampling, args.guided_radius, args.guided_eps)
+    outpath = args.out / f"{safe}_grad_rollout_diff{suffix}.png"
     fig.savefig(outpath, dpi=170)
     plt.close(fig)
 
